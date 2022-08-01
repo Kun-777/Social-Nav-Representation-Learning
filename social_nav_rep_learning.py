@@ -18,11 +18,12 @@ from termcolor import cprint
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
+import tensorboard as tb
 import pytorch_lightning as pl
 from pytorch_lightning import loggers as pl_loggers
 from PIL import Image
-from barlow_twins_loss import BarlowTwinsLoss, off_diagonal
+from barlow_twins_loss import BarlowTwinsLoss
+from vicreg import VICReg
 
 class PatchEmbedding(nn.Module):
     """ Convert a 2D image into 1D patches and embed them
@@ -64,10 +65,10 @@ class PatchEmbedding(nn.Module):
         x = self.lin_proj.forward(x)  # linear transformation
         return x
 
-class BTSNNetwork(nn.Module):
+class SNNetwork(nn.Module):
     def __init__(self, joystick_input_size: int, img_size: int, img_channels: int, patch_size=16, embedding_size=1280, output_size=256):
         # according to the author, Barlow Twins only works well with giant representation vectors
-        super(BTSNNetwork, self).__init__()
+        super(SNNetwork, self).__init__()
         self.patch_embed = PatchEmbedding(img_size=img_size, input_channels=img_channels, patch_size=patch_size, embedding_size=embedding_size)
 
         # class token from BERT
@@ -77,21 +78,23 @@ class BTSNNetwork(nn.Module):
         # learnable positional embeddings for each patch
         self.positional_embeddings = nn.Parameter(torch.zeros(1, 1 + self.patch_embed.num_patches, embedding_size))
 
+        # goal position encoder
+        self.goal_embed = nn.Sequential(nn.Linear(2, embedding_size), nn.ReLU(), nn.Linear(embedding_size, embedding_size))
+
         # transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_size, nhead=8, activation='gelu', batch_first=True)
         self.layer_norm = nn.LayerNorm(embedding_size, eps=1e-6)
         self.visual_encoder = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=6, norm=self.layer_norm)
         # MLP head and normalization for only the cls token
-        # TODO: is the last normalization needed?
-        self.mlp_head = nn.Sequential(nn.Linear(embedding_size, output_size), nn.BatchNorm1d(output_size))
+        self.mlp_head = nn.Sequential(nn.Linear(embedding_size, embedding_size), nn.ReLU(), nn.Linear(embedding_size, output_size))
 
         self.joystick_commands_encoder = nn.Sequential(
             nn.Linear(joystick_input_size, output_size), nn.BatchNorm1d(output_size), nn.ReLU(),
             nn.Linear(output_size, output_size), nn.BatchNorm1d(output_size), nn.ReLU(),
-            nn.Linear(output_size, output_size), nn.BatchNorm1d(output_size)
+            nn.Linear(output_size, output_size),
         )
 
-    def forward(self, img_batch, joystick_batch):
+    def forward(self, img_batch, joystick_batch, goal_batch):
         batch_size = img_batch.shape[0]
         # turn batch of images into embeddings
         img_batch = self.patch_embed(img_batch)
@@ -101,6 +104,8 @@ class BTSNNetwork(nn.Module):
         img_batch = torch.cat((cls_token, img_batch), dim=1)
         # add learnable positional embeddings
         img_batch += self.positional_embeddings
+        # concatenate goal embedding to end of patch embeddings
+        img_batch = torch.cat((img_batch, self.goal_embed(goal_batch).unsqueeze(1)), dim=1)
         # pass input with cls token and positional embeddings through the transformer encoder
         visual_encoding = self.visual_encoder(img_batch)
         # keep only cls token, discard rest
@@ -113,9 +118,9 @@ class BTSNNetwork(nn.Module):
 
         return cls_token, joy_stick_encodings
 
-class BTSNModel(pl.LightningModule):
+class SNModel(pl.LightningModule):
     def __init__(self, lambd, lr, weight_decay):
-        super().__init__()
+        super(SNModel, self).__init__()
         self.lr = lr
         self.weight_decay = weight_decay
 
@@ -126,26 +131,27 @@ class BTSNModel(pl.LightningModule):
         #     'full_args'
         # )
 
-        self.model = BTSNNetwork(joystick_input_size=900, img_size=400, img_channels=5)
+        self.model = SNNetwork(joystick_input_size=900, img_size=400, img_channels=5)
         self.model.to(self.device)
         self.barlow_twins_loss = BarlowTwinsLoss(lambd)
+        self.vicreg_loss = VICReg()
 
-    def forward(self, img_batch, joystick_batch):
-        return self.model(img_batch, joystick_batch)
+    def forward(self, img_batch, joystick_batch, goal_patch):
+        return self.model(img_batch, joystick_batch, goal_patch)
     
     def training_step(self, batch, batch_idx):
-        img_batch, joystick_batch = batch
-        print("training_step forwarding")
-        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float())
-        loss = self.barlow_twins_loss(img_rep, joystick_rep)
-        print("loss=%f", loss)
+        img_batch, joystick_batch, goal_patch = batch
+        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float(), goal_patch.float())
+        # loss = self.barlow_twins_loss(img_rep, joystick_rep)
+        loss = self.vicreg_loss(img_rep, joystick_rep)
         self.log('train_loss', loss, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        img_batch, joystick_batch = batch
-        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float())
-        loss = self.barlow_twins_loss(img_rep, joystick_rep)
+        img_batch, joystick_batch, goal_patch = batch
+        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float(), goal_patch.float())
+        # loss = self.barlow_twins_loss(img_rep, joystick_rep)
+        loss = self.vicreg_loss(img_rep, joystick_rep)
         self.log('val_loss', loss, prog_bar=True, logger=True)
         return loss
     
@@ -155,13 +161,14 @@ class BTSNModel(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-class BTSNDataset(Dataset):
+class SNDataset(Dataset):
     """
     Create a data set object from a single pkl file. Each index of this dataset has a 5 stacked lidar images, a flattened 1D array of joystick commands from current position to the goal 10m into the future, and a flattened 1D array of trajectory from current position to the goal 10m into the future.
     E.g. dataset[0][0] is the 5 stacked lidar images at t=0 (after delay), dataset[0][1] is the joystick commands in 10m into the future at t=0, dataset[0][2] is the trajectory in 10m into the future at t=0. 
     """
 
     def __init__(self, pickle_file_path, delay_frame=30):
+        super(SNDataset, self).__init__()
         # load the pickle file
         if not os.path.exists(pickle_file_path.replace('_data.pkl', '_final.pkl')):
             raise Exception(
@@ -256,22 +263,25 @@ class BTSNDataset(Dataset):
 
         # flatten the trajectory information in each entry, [[x, y, [a, b, c, d]], ...] to [[x, y, a, b, c, d], ...] 6*n
 
-        flattened_traj = []
-        for trajectory_val in self.data['human_expert_odom'][idx+20-1][:100]:
-            # temp = []
-            for single_traj in trajectory_val:
-                if type(single_traj) is list:
-                    for orientation in single_traj:
-                        # temp.append(orientation)
-                        flattened_traj.append(orientation)
-                else:
-                    # temp.append(single_traj)
-                    flattened_traj.append(single_traj)
-            # flattened_traj.append(temp)
+        # flattened_traj = []
+        # for trajectory_val in self.data['human_expert_odom'][idx+20-1][:100]:
+        #     # temp = []
+        #     for single_traj in trajectory_val:
+        #         if type(single_traj) is list:
+        #             for orientation in single_traj:
+        #                 # temp.append(orientation)
+        #                 flattened_traj.append(orientation)
+        #         else:
+        #             # temp.append(single_traj)
+        #             flattened_traj.append(single_traj)
+        #     # flattened_traj.append(temp)
 
-        future_trajectory = np.asarray(flattened_traj)
+        # future_trajectory = np.asarray(flattened_traj)
 
-        return bev_img_stack, future_joystick_values
+        relative_goal_pos = np.asarray([self.data['human_expert_odom'][idx+20-1][-1][0]-self.data['human_expert_odom'][idx+20-1][0][0],
+                                        self.data['human_expert_odom'][idx+20-1][-1][1]-self.data['human_expert_odom'][idx+20-1][0][1]])
+
+        return bev_img_stack, future_joystick_values, relative_goal_pos
 
     @staticmethod
     def get_affine_mat(x, y, theta):
@@ -299,10 +309,10 @@ class BTSNDataset(Dataset):
 
 class MyDataLoader(pl.LightningDataModule):
     '''
-    Load all .pkl files and lidar scans in data_path. Create a BTSNDataset for each .pkl file, and concat all into one. 
+    Load all .pkl files and lidar scans in data_path. Create a SNDataset for each .pkl file, and concat all into one. 
     '''
     def __init__(self, data_path, batch_size=32, num_workers=0, delay_frame=30):
-        super().__init__()
+        super(MyDataLoader, self).__init__()
         self.batch_size = batch_size
         self.num_workers = num_workers
 
@@ -318,14 +328,14 @@ class MyDataLoader(pl.LightningDataModule):
             print('reading pickle file : ', pickle_file_path)
             if i < int(len(pickle_file_paths)*0.75):
                 self.train_pickle_files.append(pickle_file_path)
-                tmp = BTSNDataset(pickle_file_path, delay_frame=delay_frame)
+                tmp = SNDataset(pickle_file_path, delay_frame=delay_frame)
                 # skip if the specific rosbag was small and wasn't long enough
                 if len(tmp) <= 0:
                     continue
                 self.training_dataset.append(tmp)
             else:
                 self.val_pickle_files.append(pickle_file_path)
-                tmp = BTSNDataset(pickle_file_path, delay_frame=delay_frame)
+                tmp = SNDataset(pickle_file_path, delay_frame=delay_frame)
                 if len(tmp) <= 0:
                     continue
                 self.validation_dataset.append(tmp)
@@ -363,15 +373,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Learn representations from SCAND dataset using Barlow Twins\' model.')
     parser.add_argument('--batch_size', type=int, default=4, help='batch size')
     parser.add_argument('--max_epochs', type=int, default=10, help='number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-5, help='learning rate')
+    parser.add_argument('--lr', type=float, default=3e-5, help='learning rate')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUS to use')
     parser.add_argument('--delay_frame', type=int, default=0, help='Number of initial frames to skip')
-    parser.add_argument('--num_workers', type=int, default=16, help='Number of workers to use')
+    parser.add_argument('--num_workers', type=int, default=10, help='Number of workers to use')
     parser.add_argument('--accumulate_grad_batches', type=int, default=1, help='Multiplier for batch size')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight decay')
     parser.add_argument('--lambd', type=float, default=0.0051, metavar='L', help='weight on off-diagonal terms for Barlow Twins loss')
-    parser.add_argument('--checkpoint_path', type=str, default='/home/kun/Desktop/barlow_twins_social_nav/checkpoints', help='path to save checkpoints')
-    parser.add_argument('--data_path', type=str, default='/home/kun/Desktop/barlow_twins_social_nav/data')
+    parser.add_argument('--checkpoint_path', type=str, default='/home/kun/Desktop/Social-Nav-Representation-Learning/checkpoints', help='path to save checkpoints')
+    parser.add_argument('--data_path', type=str, default='/home/kun/Desktop/Social-Nav-Representation-Learning/data')
     parser.add_argument('--notes', type=str, default='', help='notes for this specific run')
     parser.add_argument('--checkpoint', type=str, default='None')
     parser.add_argument('--use_pretrained_weight', type=str, default="")
@@ -386,7 +396,7 @@ if __name__ == '__main__':
         os.makedirs(args.checkpoint_path)
 
     # create model
-    model = BTSNModel(lambd=args.lambd, lr=args.lr, weight_decay=args.weight_decay)
+    model = SNModel(lambd=args.lambd, lr=args.lr, weight_decay=args.weight_decay)
 
     if args.use_pretrained_weight == "":
         cprint('Not using pretrained weight', 'red', attrs=['bold'])
@@ -406,7 +416,7 @@ if __name__ == '__main__':
 
     early_stopping_cb = EarlyStopping(monitor='val_loss', mode='min', min_delta=0.00, patience=100)
 
-    model_checkpoint_cb = ModelCheckpoint(dirpath='models/btsnrep/', filename=datetime.now().strftime("%d-%m-%Y-%H-%M-%S"), monitor='val_loss', mode='min')
+    model_checkpoint_cb = ModelCheckpoint(dirpath='models/snrep/', filename=datetime.now().strftime("%d-%m-%Y-%H-%M-%S"), monitor='val_loss', mode='min')
 
     # create trainer
     trainer = pl.Trainer(
@@ -427,7 +437,7 @@ if __name__ == '__main__':
     trainer.fit(model, dm)
     
     # save model
-    torch.save(model.state_dict(), 'models/btsnrep/' +
+    torch.save(model.state_dict(), 'models/snrep/' +
                datetime.now().strftime("%d-%m-%Y-%H-%M-%S") + '.pt')
     
     print('Model has been trained and saved')
