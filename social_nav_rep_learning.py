@@ -1,3 +1,4 @@
+from unittest.mock import patch
 import cv2
 import numpy as np
 import torch
@@ -7,12 +8,11 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from datetime import datetime
 import glob
-import random
 from torch.utils.data import DataLoader, Dataset, ConcatDataset
 import pickle
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
-import scipy
+import matplotlib.pyplot as plt
 # from scripts.utils import get_mask
 from termcolor import cprint
 from torch import Tensor
@@ -29,7 +29,7 @@ class PatchEmbedding(nn.Module):
     """ Convert a 2D image into 1D patches and embed them
     """
 
-    def __init__(self, img_size: int, input_channels: int, patch_size=16, embedding_size=1280) -> \
+    def __init__(self, img_size: int, input_channels: int, patch_size: int, embedding_size: int) -> \
             None:
         """ Initialize a PatchEmbedding Layer
         :param img_size: size of the input images (assume square)
@@ -65,8 +65,75 @@ class PatchEmbedding(nn.Module):
         x = self.lin_proj.forward(x)  # linear transformation
         return x
 
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, attn
+
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x, return_attention=False):
+        y, attn = self.attn(self.norm1(x))
+        if return_attention:
+            return attn
+        x = x + y
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class SNNetwork(nn.Module):
-    def __init__(self, joystick_input_size: int, img_size: int, img_channels: int, patch_size=16, embedding_size=1280, output_size=256):
+    def __init__(self, joystick_input_size: int, img_size: int, img_channels: int, patch_size: int, embedding_size=128, output_size=128):
         # according to the author, Barlow Twins only works well with giant representation vectors
         super(SNNetwork, self).__init__()
         self.patch_embed = PatchEmbedding(img_size=img_size, input_channels=img_channels, patch_size=patch_size, embedding_size=embedding_size)
@@ -79,12 +146,12 @@ class SNNetwork(nn.Module):
         self.positional_embeddings = nn.Parameter(torch.zeros(1, 1 + self.patch_embed.num_patches, embedding_size))
 
         # goal position encoder
-        self.goal_embed = nn.Sequential(nn.Linear(2, embedding_size), nn.ReLU(), nn.Linear(embedding_size, embedding_size))
+        self.goal_embed = nn.Linear(2, embedding_size)
 
         # transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_size, nhead=8, activation='gelu', batch_first=True)
         self.layer_norm = nn.LayerNorm(embedding_size, eps=1e-6)
-        self.visual_encoder = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=6, norm=self.layer_norm)
+        self.visual_encoder = nn.ModuleList([Block(dim=embedding_size, num_heads=8, norm_layer=nn.LayerNorm) for i in range(6)])
+
         # MLP head and normalization for only the cls token
         self.mlp_head = nn.Sequential(nn.Linear(embedding_size, embedding_size), nn.ReLU(), nn.Linear(embedding_size, output_size))
 
@@ -107,7 +174,9 @@ class SNNetwork(nn.Module):
         # concatenate goal embedding to end of patch embeddings
         img_batch = torch.cat((img_batch, self.goal_embed(goal_batch).unsqueeze(1)), dim=1)
         # pass input with cls token and positional embeddings through the transformer encoder
-        visual_encoding = self.visual_encoder(img_batch)
+        for block in self.visual_encoder:
+            img_batch = block(img_batch)
+        visual_encoding = self.layer_norm(img_batch)
         # keep only cls token, discard rest
         cls_token = visual_encoding[:, 0]
         # pass cls token into MLP head
@@ -118,11 +187,33 @@ class SNNetwork(nn.Module):
 
         return cls_token, joy_stick_encodings
 
+    def get_last_selfattention(self, img_batch, goal_batch):
+        batch_size = img_batch.shape[0]
+        # turn batch of images into embeddings
+        img_batch = self.patch_embed(img_batch)
+        # expand cls token from 1 batch
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        # concatenate cls token to beginning of patch embeddings
+        img_batch = torch.cat((cls_token, img_batch), dim=1)
+        # add learnable positional embeddings
+        img_batch += self.positional_embeddings
+        # concatenate goal embedding to end of patch embeddings
+        img_batch = torch.cat((img_batch, self.goal_embed(goal_batch).unsqueeze(1)), dim=1)
+
+        # we return the output tokens from the `n` last blocks
+        for i, block in enumerate(self.visual_encoder):
+            if i < len(self.visual_encoder) - 1:
+                img_batch = block(img_batch)
+            else:
+                return block(img_batch, return_attention=True)
+
+
 class SNModel(pl.LightningModule):
-    def __init__(self, lambd, lr, weight_decay):
+    def __init__(self, lambd, lr, weight_decay, patch_size):
         super(SNModel, self).__init__()
         self.lr = lr
         self.weight_decay = weight_decay
+        self.patch_size = patch_size
 
         # self.batch_size = batch_size
         # self.data_path = full_args.data_path
@@ -131,7 +222,7 @@ class SNModel(pl.LightningModule):
         #     'full_args'
         # )
 
-        self.model = SNNetwork(joystick_input_size=900, img_size=400, img_channels=5)
+        self.model = SNNetwork(joystick_input_size=900, img_size=400, img_channels=5, patch_size=patch_size)
         self.model.to(self.device)
         self.barlow_twins_loss = BarlowTwinsLoss(lambd)
         self.vicreg_loss = VICReg()
@@ -140,20 +231,32 @@ class SNModel(pl.LightningModule):
         return self.model(img_batch, joystick_batch, goal_patch)
     
     def training_step(self, batch, batch_idx):
-        img_batch, joystick_batch, goal_patch = batch
-        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float(), goal_patch.float())
+        img_batch, joystick_batch, goal_batch = batch
+        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float(), goal_batch.float())
         # loss = self.barlow_twins_loss(img_rep, joystick_rep)
         loss = self.vicreg_loss(img_rep, joystick_rep)
         self.log('train_loss', loss, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        img_batch, joystick_batch, goal_patch = batch
-        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float(), goal_patch.float())
+        img_batch, joystick_batch, goal_batch = batch
+        img_rep, joystick_rep = self.forward(img_batch.float(), joystick_batch.float(), goal_batch.float())
         # loss = self.barlow_twins_loss(img_rep, joystick_rep)
         loss = self.vicreg_loss(img_rep, joystick_rep)
         self.log('val_loss', loss, prog_bar=True, logger=True)
         return loss
+    
+    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx):
+        img_batch, _, goal_batch = batch
+        attentions = self.model.get_last_selfattention(img_batch=img_batch.float(), goal_batch=goal_batch.float())
+        nh = attentions.shape[1] # number of head
+        # we keep only the output patch attention
+        numfeat = img_batch.shape[-1] // self.patch_size
+        attentions = attentions[0, :, 1:-1, 1:-1].reshape(nh, numfeat**2, numfeat**2)
+        attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=self.patch_size, mode="nearest")[0].cpu().detach().numpy()
+        plt.imshow(attentions[0], cmap=plt.cm.gray)
+        
+
     
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
@@ -278,8 +381,9 @@ class SNDataset(Dataset):
 
         # future_trajectory = np.asarray(flattened_traj)
 
-        relative_goal_pos = np.asarray([self.data['human_expert_odom'][idx+20-1][-1][0]-self.data['human_expert_odom'][idx+20-1][0][0],
-                                        self.data['human_expert_odom'][idx+20-1][-1][1]-self.data['human_expert_odom'][idx+20-1][0][1]])
+        # relative_goal_pos = np.asarray([self.data['human_expert_odom'][idx+20-1][-1][0]-self.data['human_expert_odom'][idx+20-1][0][0],
+        #                                 self.data['human_expert_odom'][idx+20-1][-1][1]-self.data['human_expert_odom'][idx+20-1][0][1]])
+        relative_goal_pos = np.asarray([self.data['local_goal_human_odom'][idx+20-1][-1][0],self.data['local_goal_human_odom'][idx+20-1][-1][1]])
 
         return bev_img_stack, future_joystick_values, relative_goal_pos
 
@@ -374,14 +478,15 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=4, help='batch size')
     parser.add_argument('--max_epochs', type=int, default=10, help='number of epochs')
     parser.add_argument('--lr', type=float, default=3e-5, help='learning rate')
-    parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUS to use')
+    parser.add_argument('--num_gpus', type=int, default=4, help='Number of GPUS to use')
     parser.add_argument('--delay_frame', type=int, default=0, help='Number of initial frames to skip')
     parser.add_argument('--num_workers', type=int, default=10, help='Number of workers to use')
+    parser.add_argument('--patch_size', type=int, default=16, help='patch size')
     parser.add_argument('--accumulate_grad_batches', type=int, default=1, help='Multiplier for batch size')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight decay')
     parser.add_argument('--lambd', type=float, default=0.0051, metavar='L', help='weight on off-diagonal terms for Barlow Twins loss')
-    parser.add_argument('--checkpoint_path', type=str, default='/home/kun/Desktop/Social-Nav-Representation-Learning/checkpoints', help='path to save checkpoints')
-    parser.add_argument('--data_path', type=str, default='/home/kun/Desktop/Social-Nav-Representation-Learning/data')
+    parser.add_argument('--checkpoint_path', type=str, default='./checkpoints', help='path to save checkpoints')
+    parser.add_argument('--data_path', type=str, default='./data')
     parser.add_argument('--notes', type=str, default='', help='notes for this specific run')
     parser.add_argument('--checkpoint', type=str, default='None')
     parser.add_argument('--use_pretrained_weight', type=str, default="")
@@ -396,7 +501,7 @@ if __name__ == '__main__':
         os.makedirs(args.checkpoint_path)
 
     # create model
-    model = SNModel(lambd=args.lambd, lr=args.lr, weight_decay=args.weight_decay)
+    model = SNModel(lambd=args.lambd, lr=args.lr, weight_decay=args.weight_decay, patch_size=8)
 
     if args.use_pretrained_weight == "":
         cprint('Not using pretrained weight', 'red', attrs=['bold'])
@@ -423,15 +528,14 @@ if __name__ == '__main__':
         gpus=1 if args.num_gpus == 1 else list(np.arange(int(args.num_gpus))),
         max_epochs=args.max_epochs,
         callbacks=[early_stopping_cb, model_checkpoint_cb],
-        logger=pl_loggers.TensorBoardLogger("lightning_logs/global_local_planner/"),
+        # logger=pl_loggers.TensorBoardLogger("lightning_logs/global_local_planner/"),
         # distributed_backend='gloo',
         stochastic_weight_avg=True,
         gradient_clip_val=1.0,
         accumulate_grad_batches=args.accumulate_grad_batches,
         num_sanity_val_steps=-1,
         # replace_sampler_ddp=False,
-        progress_bar_refresh_rate=1,
-        accelerator='cpu'
+        progress_bar_refresh_rate=1
     )
 
     trainer.fit(model, dm)
