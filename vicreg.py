@@ -14,8 +14,8 @@ class VICReg(nn.Module):
     def forward(self, x, y):
         self.batch_size = x.shape[1]
         repr_loss = F.mse_loss(x, y)
-        # x = torch.cat(FullGatherLayer.apply(x), dim=0)
-        # y = torch.cat(FullGatherLayer.apply(x), dim=0)
+        x = torch.cat(FullGatherLayer.apply(x), dim=0)
+        y = torch.cat(FullGatherLayer.apply(x), dim=0)
         x = x - x.mean(dim=0)
         y = y - y.mean(dim=0)
 

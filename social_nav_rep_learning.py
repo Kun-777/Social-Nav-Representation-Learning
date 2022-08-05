@@ -1,4 +1,3 @@
-from unittest.mock import patch
 import cv2
 import numpy as np
 import torch
@@ -6,6 +5,7 @@ import argparse
 import os
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
+from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAveraging
 from datetime import datetime
 import glob
 from torch.utils.data import DataLoader, Dataset, ConcatDataset
@@ -13,7 +13,6 @@ import pickle
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-# from scripts.utils import get_mask
 from termcolor import cprint
 from torch import Tensor
 import torch.nn as nn
@@ -24,6 +23,8 @@ from pytorch_lightning import loggers as pl_loggers
 from PIL import Image
 from barlow_twins_loss import BarlowTwinsLoss
 from vicreg import VICReg
+from distributed import init_distributed_mode
+from skimage.measure import block_reduce
 
 class PatchEmbedding(nn.Module):
     """ Convert a 2D image into 1D patches and embed them
@@ -155,9 +156,23 @@ class SNNetwork(nn.Module):
         # MLP head and normalization for only the cls token
         self.mlp_head = nn.Sequential(nn.Linear(embedding_size, embedding_size), nn.ReLU(), nn.Linear(embedding_size, output_size))
 
+        # self.projector = nn.Sequential(
+        #     nn.Linear(embedding_size, output_size),
+        #     nn.BatchNorm1d(output_size),
+        #     nn.ReLU(),
+        #     nn.Linear(output_size, output_size),
+        #     nn.BatchNorm1d(output_size),
+        #     nn.ReLU(),
+        #     nn.Linear(output_size, output_size),
+        # )
+
         self.joystick_commands_encoder = nn.Sequential(
-            nn.Linear(joystick_input_size, output_size), nn.BatchNorm1d(output_size), nn.ReLU(),
-            nn.Linear(output_size, output_size), nn.BatchNorm1d(output_size), nn.ReLU(),
+            nn.Linear(joystick_input_size, output_size, bias=False), 
+            nn.BatchNorm1d(output_size), 
+            nn.ReLU(),
+            nn.Linear(output_size, output_size, bias=False), 
+            nn.BatchNorm1d(output_size), 
+            nn.ReLU(),
             nn.Linear(output_size, output_size),
         )
 
@@ -181,6 +196,7 @@ class SNNetwork(nn.Module):
         cls_token = visual_encoding[:, 0]
         # pass cls token into MLP head
         cls_token = self.mlp_head(cls_token)
+        # cls_token = self.projector(cls_token)
 
         # encode joystick commands
         joy_stick_encodings = self.joystick_commands_encoder(joystick_batch)
@@ -222,7 +238,7 @@ class SNModel(pl.LightningModule):
         #     'full_args'
         # )
 
-        self.model = SNNetwork(joystick_input_size=900, img_size=400, img_channels=5, patch_size=patch_size)
+        self.model = SNNetwork(joystick_input_size=900, img_size=240, img_channels=5, patch_size=patch_size)
         self.model.to(self.device)
         self.barlow_twins_loss = BarlowTwinsLoss(lambd)
         self.vicreg_loss = VICReg()
@@ -246,15 +262,15 @@ class SNModel(pl.LightningModule):
         self.log('val_loss', loss, prog_bar=True, logger=True)
         return loss
     
-    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx):
-        img_batch, _, goal_batch = batch
-        attentions = self.model.get_last_selfattention(img_batch=img_batch.float(), goal_batch=goal_batch.float())
-        nh = attentions.shape[1] # number of head
-        # we keep only the output patch attention
-        numfeat = img_batch.shape[-1] // self.patch_size
-        attentions = attentions[0, :, 1:-1, 1:-1].reshape(nh, numfeat**2, numfeat**2)
-        attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=self.patch_size, mode="nearest")[0].cpu().detach().numpy()
-        plt.imshow(attentions[0], cmap=plt.cm.gray)
+    # def on_validation_batch_start(self, batch, batch_idx, dataloader_idx):
+    #     img_batch, _, goal_batch = batch
+    #     attentions = self.model.get_last_selfattention(img_batch=img_batch.float(), goal_batch=goal_batch.float())
+    #     nh = attentions.shape[1] # number of head
+    #     # we keep only the output patch attention
+    #     numfeat = img_batch.shape[-1] // self.patch_size
+    #     attentions = attentions[0, :, 1:-1, 1:-1].reshape(nh, numfeat**2, numfeat**2)
+    #     attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=self.patch_size, mode="nearest")[0].cpu().detach().numpy()
+    #     plt.imshow(attentions[0], cmap=plt.cm.gray)
         
 
     
@@ -304,7 +320,7 @@ class SNDataset(Dataset):
         idx = self.delay_frame + idx
 
         bev_img_stack = [np.array(Image.open(os.path.join(
-            self.bev_lidar_dir, f'{x}.png'))) for x in range(idx, idx + 20)]
+            self.bev_lidar_dir, f'{x}.png'))) for x in range(idx + 1, idx + 21)]
         bev_img_stack_odoms = self.data['odom'][idx:idx+20]
         bev_img_stack = [bev_img_stack[i] for i in [0, 5, 10, 15, 19]]
         bev_img_stack_odoms = [bev_img_stack_odoms[i]
@@ -344,22 +360,17 @@ class SNDataset(Dataset):
         bev_img_stack[3] = cv2.warpAffine(
             bev_img_stack[3], T_4_5[:2, :], (401, 401))
 
-        # cut image to 400 x 400
-        new_img_stack = []
-        for bev_img in bev_img_stack:
-            new_img = []
-            for i, row in enumerate(bev_img):
-                row = np.resize(row, 400)
-                if i != 400:
-                    new_img.append(row)
-            new_img = np.asarray(new_img)
-            new_img_stack.append(new_img)
-
-
         # combine the 5 single-channel images into a single image of 5 channels
-        bev_img_stack = np.asarray(new_img_stack).astype(np.float32)
-        # bev_img_stack = np.asarray(bev_img_stack).astype(np.float32)
+        bev_img_stack = np.asarray(bev_img_stack).astype(np.float32)
         bev_img_stack = bev_img_stack / 255.0  # normalize the image
+
+        # cut image to 240 x 240
+        bev_img_stack = bev_img_stack[:, 80:320, 80:320]
+
+        # represent image by mean and variance of each 4x4 sub image
+        # means = block_reduce(bev_img_stack, block_size=(1, 4, 4), func=np.mean)
+        # vars = block_reduce(bev_img_stack, block_size=(1, 4, 4), func=np.var)
+        # bev_img_stack = np.concatenate((means, vars), axis=0)
 
         # truncate to 300 future joystick commands
         future_joystick_values = np.asarray(self.data['future_joystick'][idx+20-1][:300]).flatten()
@@ -475,10 +486,10 @@ class MyDataLoader(pl.LightningDataModule):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Learn representations from SCAND dataset using Barlow Twins\' model.')
-    parser.add_argument('--batch_size', type=int, default=4, help='batch size')
-    parser.add_argument('--max_epochs', type=int, default=10, help='number of epochs')
+    parser.add_argument('--batch_size', type=int, default=128, help='batch size')
+    parser.add_argument('--max_epochs', type=int, default=1000, help='number of epochs')
     parser.add_argument('--lr', type=float, default=3e-5, help='learning rate')
-    parser.add_argument('--num_gpus', type=int, default=4, help='Number of GPUS to use')
+    parser.add_argument('--num_gpus', type=int, default=8, help='Number of GPUS to use')
     parser.add_argument('--delay_frame', type=int, default=0, help='Number of initial frames to skip')
     parser.add_argument('--num_workers', type=int, default=10, help='Number of workers to use')
     parser.add_argument('--patch_size', type=int, default=16, help='patch size')
@@ -490,7 +501,17 @@ if __name__ == '__main__':
     parser.add_argument('--notes', type=str, default='', help='notes for this specific run')
     parser.add_argument('--checkpoint', type=str, default='None')
     parser.add_argument('--use_pretrained_weight', type=str, default="")
+
+    # distributed
+    parser.add_argument('--world-size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--dist-url', default='env://',
+                        help='url used to set up distributed training')
+
     args = parser.parse_args()
+
+    init_distributed_mode(args)
 
     # check if data path exists
     if not os.path.exists(args.data_path):
@@ -519,23 +540,24 @@ if __name__ == '__main__':
     # load data
     dm = MyDataLoader(data_path=args.data_path, batch_size=args.batch_size, num_workers=args.num_workers, delay_frame=args.delay_frame)
 
-    early_stopping_cb = EarlyStopping(monitor='val_loss', mode='min', min_delta=0.00, patience=100)
+    # early_stopping_cb = EarlyStopping(monitor='val_loss', mode='min', min_delta=0.00, patience=100)
 
     model_checkpoint_cb = ModelCheckpoint(dirpath='models/snrep/', filename=datetime.now().strftime("%d-%m-%Y-%H-%M-%S"), monitor='val_loss', mode='min')
+
+    swa_cb = StochasticWeightAveraging(swa_lrs=1e-2)
 
     # create trainer
     trainer = pl.Trainer(
         gpus=1 if args.num_gpus == 1 else list(np.arange(int(args.num_gpus))),
         max_epochs=args.max_epochs,
-        callbacks=[early_stopping_cb, model_checkpoint_cb],
-        # logger=pl_loggers.TensorBoardLogger("lightning_logs/global_local_planner/"),
-        # distributed_backend='gloo',
+        precision=16,
+        callbacks=[model_checkpoint_cb, swa_cb],
+        logger=pl_loggers.TensorBoardLogger("lightning_logs/social_nav_rep/"),
         stochastic_weight_avg=True,
         gradient_clip_val=1.0,
         accumulate_grad_batches=args.accumulate_grad_batches,
         num_sanity_val_steps=-1,
-        # replace_sampler_ddp=False,
-        progress_bar_refresh_rate=1
+        strategy = 'dp'
     )
 
     trainer.fit(model, dm)
