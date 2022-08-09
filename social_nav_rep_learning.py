@@ -262,15 +262,23 @@ class SNModel(pl.LightningModule):
         self.log('val_loss', loss, prog_bar=True, logger=True)
         return loss
     
-    # def on_validation_batch_start(self, batch, batch_idx, dataloader_idx):
-    #     img_batch, _, goal_batch = batch
-    #     attentions = self.model.get_last_selfattention(img_batch=img_batch.float(), goal_batch=goal_batch.float())
-    #     nh = attentions.shape[1] # number of head
-    #     # we keep only the output patch attention
-    #     numfeat = img_batch.shape[-1] // self.patch_size
-    #     attentions = attentions[0, :, 1:-1, 1:-1].reshape(nh, numfeat**2, numfeat**2)
-    #     attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=self.patch_size, mode="nearest")[0].cpu().detach().numpy()
-    #     plt.imshow(attentions[0], cmap=plt.cm.gray)
+    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx):
+        if self.current_epoch % 5 == 0 and batch_idx % 100 == 0:
+            img_batch, _, goal_batch = batch
+            with torch.no_grad():
+                attentions = self.model.get_last_selfattention(img_batch=img_batch.float().cuda(), goal_batch=goal_batch.float().cuda())
+                nh = attentions.shape[1] # number of head
+                # we keep only the output patch attention
+                numfeat = img_batch.shape[-1] // self.patch_size
+                attentions = attentions[63, :, 0, 1:-1].reshape(nh, -1)
+                attentions = attentions.reshape(nh, 240 // self.patch_size, 240 // self.patch_size)
+                attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=self.patch_size, mode="nearest")[0].cpu().detach().numpy()
+                orig_img = img_batch[63][0].cpu().detach().numpy()
+                for i in range(5):
+                    orig_img = cv2.addWeighted(orig_img,1,img_batch[63][i].cpu().detach().numpy(),np.power(0.85,i*4),0)
+                self.logger.experiment.add_image('original img: {}_{}'.format(batch_idx, dataloader_idx), torch.from_numpy(orig_img).unsqueeze(0), self.current_epoch)
+                self.logger.experiment.add_image('attention map: {}_{}'.format(batch_idx, dataloader_idx), torch.from_numpy(
+                    attentions[0]*255).unsqueeze(0), self.current_epoch)
         
 
     
